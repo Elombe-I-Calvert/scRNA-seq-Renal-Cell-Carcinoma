@@ -1,0 +1,293 @@
+---
+title: "Final Project"
+author: "Elombe Calvert"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load all your libraries here
+library(Seurat)
+library(tidyverse)
+library(data.table)
+library(Matrix)
+library(harmony)
+```
+
+The code block below makes the fully formed Seurat object, with completed metadata
+```{r}
+# Read in file with counts data
+counts  = readRDS("renal_counts.rds")
+
+# Read in meta.data
+meta.data = read_csv("Final_SCP_Metadata.csv") 
+
+## Create the Seurat Object
+sc_obj <- CreateSeuratObject(counts = counts)
+
+# wrangle out rownames
+sc_obj@meta.data$ cells <- rownames(sc_obj@meta.data)
+
+# Join counts and metadata
+sc_obj@meta.data <- left_join(sc_obj@meta.data,meta.data, by=c("cells"="NAME"))
+
+# Setting rownames 
+rownames(sc_obj@meta.data) <- sc_obj@meta.data$cells
+sc_obj@meta.data$cells <- NULL
+
+```
+
+
+```{r}
+# DATA EXOLORATION
+
+# Calculate % Mitochondrial UMI
+sc_obj[["percent_mito"]] <- PercentageFeatureSet(sc_obj, pattern = "^MT-")
+
+# Violin Plot 
+VlnPlot(sc_obj, features = c("nFeature_RNA", "nCount_RNA", "percent_mito"), ncol = 3)
+
+# Scatter plot to access cell quality
+ggplot(sc_obj@meta.data, aes(x = nFeature_RNA, y = percent_mito)) + geom_point()
+
+```
+```{r}
+
+# QUALITY CONTROL STEPS
+
+# From the paper Bi, et al. Tumor and immune reprogramming during immunotherapy 
+# in advanced renal cell carcinoma they:
+# - Removed cells with less than 200 genes are removed
+# - Remove cells > 25% mitochondrial RNA
+
+# We are keeping the following cells, bye bye poor quality cells!!
+sc_obj <- subset(sc_obj, subset = nFeature_RNA > 200 & percent_mito < 25)
+
+```
+
+```{r}
+# Data Pre-processing
+
+# From the paper Bi, et al. Tumor and immune reprogramming during immunotherapy 
+# in advanced renal cell carcinoma they:
+# - Normalized, scaled by 10,000 and log transformed
+# - 10,000 variable features were chosen
+
+# Normalize
+sc_obj <- NormalizeData(sc_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Feature selection
+sc_obj <- FindVariableFeatures(sc_obj, selection.method = "vst", nfeatures = 10000)
+
+# Scale
+sc_obj <- ScaleData(sc_obj, do.scale  = TRUE, do.center = TRUE)
+
+```
+
+```{r}
+# Dimensionality Reduction
+
+# Run PCA
+sc_obj <- RunPCA(sc_obj,verbose = FALSE) 
+
+# Elbow Plot
+ElbowPlot(sc_obj, ndims = 20, reduction = "pca")
+
+# Chose the first 15 PCs
+sc_obj <- RunUMAP(sc_obj, dims = 1:20)
+
+```
+
+```{r}
+# Visualize Data by potential batch effects 
+
+# Donor ID
+UMAPPlot(sc_obj, group.by = "donor_id")
+
+# Biosample
+UMAPPlot(sc_obj, group.by = "biosample_id")
+
+# Organ based biopsy 
+UMAPPlot(sc_obj, group.by = "organ__ontology_label")
+
+# Sex 
+UMAPPlot(sc_obj, group.by = "sex")
+
+```
+
+```{r}
+# Batch Effect
+
+# Harmonize data
+sc_obj = RunHarmony(sc_obj, c("donor_id","biosample_id","organ__ontology_label"))
+sc_obj <- RunUMAP(sc_obj, dims = 1:20, reduction = "harmony", reduction.name = "umap_harmony")
+
+# Re plot data to demonstrate harmony  
+DimPlot(sc_obj, reduction = "umap_harmony", group.by = "donor_id")
+DimPlot(sc_obj, reduction = "umap_harmony", group.by = "biosample_id")
+DimPlot(sc_obj, reduction = "umap_harmony", group.by = "organ__ontology_label")
+DimPlot(sc_obj, reduction = "umap_harmony", group.by = "sex")
+```
+
+```{r}
+# Cluster the data using the Louvain algorithm
+
+# From the paper Bi, et al. Tumor and immune reprogramming during immunotherapy 
+# in advanced renal cell carcinoma they used 0.5 resolution
+
+# Build graph 
+sc_obj <- FindNeighbors(sc_obj, dims = 1:20, reduction = "harmony")
+sc_obj <- FindClusters(sc_obj, resolution = 0.5, algorithm = 1)
+
+# Cluster graph
+DimPlot(sc_obj, reduction = "umap_harmony", label = T, group.by = "RNA_snn_res.0.5")
+```
+
+```{r q2g-code, fig.height=8,fig.width=10}
+# Wilcoxon test to identify marker genes that are most highly expressed in each cluster
+
+# Test each cluster
+Idents(sc_obj) = "RNA_snn_res.0.5"
+top_markers = FindAllMarkers(sc_obj, logfc.threshold = 0.5, 
+                             test.use = "wilcox",only.pos=TRUE)
+```
+
+
+```{r,fig.height=8,fig.width=10}
+# Plot Heat Map top markers genes
+top3 = top_markers %>% 
+  group_by(cluster) %>% 
+  top_n(n = 3, wt = avg_log2FC)
+
+DoHeatmap(sc_obj, features = top3$gene)
+```
+
+```{txt}
+
+# Annotating clusters based on paper & Panglao DB
+
+Cluster 0:Plasma Cells
+Gene marker: IGLC2, IGLC3, IGKC
+
+Cluster 1: Plasma Cells
+Gene marker: IGLC2, IGLC3, IGKC
+
+Cluster 2: Dendritc Cells
+Gene marker: c1qb,c1qa,apoe
+
+Cluster 3: TP1 Cells (Tumor cells)
+Gene marker: PDK4, VEGFA, ACSM2A
+
+cluster 4:  Fibroblasts
+Gene marker: IGFBP5,NDUFA4L2,PPDPFL
+
+Cluster 5: NK cells
+Gene marker: KLRC1, KLRC1, GNLY
+  
+Cluster 6: Monocytes
+Gene marker: S100A8
+  
+Cluster 7: Monocytes
+Gene marker: S100A8
+  
+Cluster 8: Hepatocytes
+Gene marker: SAA1,RARRES2
+  
+Cluster 9: Cycling cells
+Gene marker: STMN1, HIST1H4C, TUBB
+
+Cluster 10: B cells
+Gene marker: CD79A, MS4A1
+
+Cluster 11: B cells
+Gene marker: CD79A, MS4A1
+
+Cluster 12: Endothelial cells
+Gene marker: VWF, MGP,CLDN5
+
+Cluster 13: Hepatocytes
+Gene marker: RARRES2
+
+Cluster 14: Hepatocytes
+Gene marker: COL1A2, COL1A1
+```
+
+DOWNSTREAM ANALYSES
+
+```{r}
+# [1] DIFFERENTIAL EXPRESSION
+# Biological Question: Genes differentially expressed in patients who received ICB vs no ICB
+
+# Set the identity classes based on Exposure to ICB
+sc_obj <- SetIdent(sc_obj, value = "ICB_Response")
+
+# Differential expression analysis between Exposure to ICB vs no ICB
+dif_ex <- FindMarkers(sc_obj, ident.1 = "NoICB", ident.2 = "ICB_SD", ident.3 = "ICB_PR", ident.4="ICB_PD",verbose = FALSE)
+
+# Select top 10 differentially expressed genes
+top_genes <- head(rownames(dif_ex), 10)
+```
+
+```{r,fig.height=8,fig.width=10}
+# Plot heatmap
+DoHeatmap(sc_obj, features = top_genes, group.by = 'ICB_Response', label = TRUE)
+
+```
+```{r}
+# [2] DIFFERENTIAL ABUNDANCE
+
+# Assign cell type name to cluster in meta data
+
+sc_obj@meta.data<- sc_obj@meta.data %>% 
+  mutate(cell_type = case_when(
+    seurat_clusters %in% c("0","1") ~ "Plasma Cells",
+    seurat_clusters %in% c("2")     ~ "Dendritic Cells",
+    seurat_clusters %in% c("3")     ~ "Tumor Cells",
+    seurat_clusters %in% c("4")     ~ "Fibroblasts",
+    seurat_clusters %in% c("5")     ~ "NK Cells",
+    seurat_clusters %in% c("6","7") ~ "Monocytes",
+    seurat_clusters %in% c("8","13","14") ~ "Hepatocytes",
+    seurat_clusters %in% c("9")     ~ "Cycling Cells",
+    seurat_clusters %in% c("10","11") ~ "B Cells",
+    seurat_clusters %in% c("12") ~ "Endothelial Cells"
+  ))
+
+# Plot of cell type abundance
+ggplot(sc_obj@meta.data, aes(x=cell_type, fill=cell_type))+
+  geom_bar()+ 
+  theme(axis.text.x= element_text(size = 7, angle = 90),
+        legend.key.size = unit(0.2, 'cm'))+
+  labs(title = "cell type abundance", y = "abundance (counts)", x = "cell type clusters")
+
+# Cell type Abundance by ICB Response
+sc_obj@meta.data %>% 
+  group_by(ICB_Response,cell_type) %>% 
+  summarise(Proportion = n()/nrow(sc_obj@meta.data),.groups = "drop") %>% 
+
+# Plot  Cell type Abundance by ICB Response
+  ggplot(.) +
+  geom_bar(aes(x = ICB_Response, y = Proportion, fill = cell_type), 
+           position = "stack", stat = "identity")+ 
+  theme(legend.key.size = unit(0.2, 'cm'))+
+  labs(title = "cell type abundance by ICB respnse", y = "abundance (counts)", x = "Response to ICB")
+
+```
+
+```{r}
+# Pearson's Chi-squared test to prove whether there is a significant difference in each of the ICP Response groups
+
+sc_obj@meta.data %>% 
+  
+  # Data wrangling
+  group_by(ICB_Response,cell_type) %>% 
+  summarise(Counts = n(),.groups="drop") %>% 
+  pivot_wider(names_from=ICB_Response,values_from=Counts) %>% 
+  column_to_rownames("cell_type") %>% 
+  mutate(ICB_NE = ifelse(is.na(ICB_NE), 0, ICB_NE)) %>% 
+ 
+  #Chi-squared test
+  chisq.test(.)
+
+```
